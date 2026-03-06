@@ -1,22 +1,164 @@
 package com.audiocutterproject
 
 import android.net.Uri
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.Transformer
-import androidx.media3.transformer.ExportException
-import android.media.MediaMetadataRetriever
+import android.media.*
+import androidx.media3.common.*
+import androidx.media3.transformer.*
 import com.facebook.react.bridge.*
+import java.io.*
+import androidx.documentfile.provider.DocumentFile
 import java.io.File
-import androidx.documentfile.provider.DocumentFile // Step 1을 위해 필요
-import java.io.FileInputStream
+import java.nio.ByteBuffer
+import kotlin.math.abs
 
 class AudioEditorModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
     override fun getName(): String = "AudioEditor"
+
+    private var mediaPlayer: MediaPlayer? = null
+
+    @ReactMethod
+    fun getWaveformData(path: String, points: Int, promise: Promise) {
+        // 💡 무거운 디코딩 작업은 반드시 별도 스레드에서 수행해야 합니다.
+        Thread {
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(path)
+                val trackIndex = 0
+                val format = extractor.getTrackFormat(trackIndex)
+                val codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+                codec.configure(format, null, null, 0)
+                codec.start()
+
+                val info = MediaCodec.BufferInfo()
+                val amplitudes = mutableListOf<Float>()
+                var isEOS = false
+                extractor.selectTrack(trackIndex)
+
+                // 디코딩 루프
+                while (!isEOS) {
+                    val inIndex = codec.dequeueInputBuffer(10000)
+                    if (inIndex >= 0) {
+                        val buffer = codec.getInputBuffer(inIndex)
+                        val sampleSize = extractor.readSampleData(buffer!!, 0)
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            isEOS = true
+                        } else {
+                            codec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+
+                    var outIndex = codec.dequeueOutputBuffer(info, 10000)
+                    // 💡 여러 개의 출력 버퍼가 쌓여있을 수 있으므로 루프로 처리하는 것이 안전합니다.
+                    while (outIndex >= 0) {
+                        val outBuffer = codec.getOutputBuffer(outIndex)
+                        val pcmData = ShortArray(info.size / 2)
+                        outBuffer?.asShortBuffer()?.get(pcmData)
+                        
+                        var sum = 0L
+                        for (sample in pcmData) {
+                            sum += abs(sample.toInt())
+                        }
+                        if (pcmData.isNotEmpty()) {
+                            amplitudes.add(sum.toFloat() / pcmData.size)
+                        }
+                        codec.releaseOutputBuffer(outIndex, false)
+                        outIndex = codec.dequeueOutputBuffer(info, 0) // 다음 버퍼 확인
+                    }
+                }
+
+                codec.stop()
+                codec.release()
+                extractor.release()
+
+                // 리샘플링 및 React Native로 결과 전달
+                val sampledWaveform = WritableNativeArray()
+                if (amplitudes.isNotEmpty()) {
+                    val step = amplitudes.size / points
+                    val maxAmplitude = amplitudes.maxOrNull() ?: 1.0f
+                    
+                    for (i in 0 until points) {
+                        val index = (i * step).coerceAtMost(amplitudes.size - 1)
+                        val normalized = (amplitudes[index] / maxAmplitude) * 1.5
+                        sampledWaveform.pushDouble(normalized.toDouble().coerceAtMost(1.0))
+                    }
+                }
+                
+                // 성공 결과 반환
+                promise.resolve(sampledWaveform)
+
+            } catch (e: Exception) {
+                try { extractor.release() } catch (ex: Exception) {}
+                promise.reject("ERR_WAVEFORM", e.message)
+            }
+        }.start() // 💡 스레드 시작
+    }
+
+    @ReactMethod
+    fun getRealPath(uriString: String, promise: Promise) {
+        try {
+            val uri = Uri.parse(uriString)
+            
+            // 💡 DocumentFile을 사용하여 파일 정보에 안전하게 접근합니다.
+            val documentFile = DocumentFile.fromSingleUri(reactApplicationContext, uri)
+            val fileName = documentFile?.name ?: "temp_audio_file"
+
+            // 앱의 내부 캐시 디렉토리에 원본 이름으로 임시 파일 생성
+            val tempFile = File(reactApplicationContext.cacheDir, fileName)
+            
+            val inputStream = reactApplicationContext.contentResolver.openInputStream(uri)
+            val outputStream = FileOutputStream(tempFile)
+            
+            inputStream?.use { input ->
+                outputStream.use { output ->
+                    input.copyTo(output) // 💡 파일 복사 실행
+                }
+            }
+
+            // 분석기가 읽을 수 있는 실제 물리 경로 반환
+            promise.resolve(tempFile.absolutePath)
+        } catch (e: Exception) {
+            promise.reject("ERR_PATH", "파일 경로 변환 실패: ${e.message}")
+        }
+    }
+
+    @ReactMethod
+    fun startPlay(path: String, promise: Promise) {
+        try {
+            mediaPlayer?.stop()
+            mediaPlayer?.release()
+            mediaPlayer = MediaPlayer().apply {
+                setDataSource(reactApplicationContext, Uri.parse(path))
+                prepare()
+                start()
+            }
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_PLAY", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun stopPlay(promise: Promise) {
+        mediaPlayer?.stop()
+        mediaPlayer?.release()
+        mediaPlayer = null
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun getCurrentPosition(promise: Promise) {
+        // 💡 .currentPosition 속성을 인식하게 됩니다.
+        promise.resolve(mediaPlayer?.currentPosition ?: 0)
+    }
+
+    @ReactMethod
+    fun seekTo(msec: Int, promise: Promise) {
+        mediaPlayer?.seekTo(msec)
+        promise.resolve(true)
+    }
 
     // 1. Trim 기능 (자르기)
     @ReactMethod
