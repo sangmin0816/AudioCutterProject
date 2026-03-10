@@ -16,13 +16,13 @@ import {
 import * as DocumentPicker from '@react-native-documents/picker';
 import Slider from '@react-native-community/slider';
 import RNFS from 'react-native-fs';
+import { FileLogger } from "react-native-file-logger";
 
 const { AudioEditor } = NativeModules;
 const screenWidth = Dimensions.get('window').width;
-const WAVEFORM_WIDTH = screenWidth - 80; // 일관된 너비 정의
+const WAVEFORM_WIDTH = screenWidth - 80;
 
 const App = () => {
-  // --- 상태 관리 ---
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [fileUri, setFileUri] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
@@ -37,9 +37,12 @@ const App = () => {
   const [inputHour, setInputHour] = useState('0');
   const [inputMin, setInputMin] = useState('0');
   const [inputSec, setInputSec] = useState('0');
-  const [splitPosition, setSplitPosition] = useState<number | null>(null);
+  const [splitPosition, setSplitPosition] = useState<number>(0);
+  const [fileTimestamp, setFileTimestamp] = useState<number>(0);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  // 💡 초기 설정을 마쳤는지 확인하는 ref (드래그 방해 금지용)
+  const isInitialSet = useRef(false);
 
   // --- 유틸리티 함수 ---
   const formatTime = (millis: number) => {
@@ -51,6 +54,7 @@ const App = () => {
     return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
   };
 
+  // ms 데이터를 '시, 분, 초' 입력창 텍스트로 변환
   const updateInputFromMs = useCallback((ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);
     const h = Math.floor(totalSeconds / 3600);
@@ -61,7 +65,7 @@ const App = () => {
     setInputSec(s.toString());
   }, []);
 
-  // --- 재생 위치 추적 (Interval) ---
+  // --- 재생 타이머 로직 ---
   const startProgressTimer = () => {
     stopProgressTimer();
     timerRef.current = setInterval(async () => {
@@ -69,14 +73,10 @@ const App = () => {
         const pos = await AudioEditor.getCurrentPosition();
         if (pos !== undefined) {
           setCurrentPosition(pos);
-          if (pos >= duration && duration > 0) {
-            onStopPlay();
-          }
+          if (pos >= duration && duration > 0) onStopPlay();
         }
-      } catch (e) {
-        console.error(e);
-      }
-    }, 50); // 💡 더 부드러운 이동을 위해 50ms로 조정
+      } catch (e) { console.error(e); }
+    }, 50);
   };
 
   const stopProgressTimer = () => {
@@ -86,14 +86,52 @@ const App = () => {
     }
   };
 
-  // --- 이벤트 핸들러 ---
-  const handleSliderChange = (value: number) => {
-    setCurrentPosition(value);
-    updateInputFromMs(value);
+  // 💡 1. 파일 로드 시 초기 중앙 배치 로직
+  useEffect(() => {
+    if (duration > 0 && !isInitialSet.current) {
+      const middle = duration / 2;
+      setSplitPosition(middle);
+      updateInputFromMs(middle);
+      isInitialSet.current = true; // 설정 완료 🌸
+    }
+  }, [duration, fileUri, updateInputFromMs, fileTimestamp]);
+
+  // 💡 2. 수직 분할선 드래그 시 함수
+  const handleSplitChange = (value: number) => {
+    setSplitPosition(value);
+    updateInputFromMs(value); // 시간 입력창 즉시 업데이트
   };
 
-  const handleSliderComplete = async (value: number) => {
-    await AudioEditor.seekTo(Math.floor(value));
+  const handleSplitComplete = async (value: number) => {
+    try {
+      await AudioEditor.seekTo(Math.floor(value));
+      setCurrentPosition(value);
+    } catch (e) { console.error(e); }
+  };
+
+  // 💡 3. 시간 직접 입력 시 선 위치 업데이트 (분할 실행 시 호출되거나 필요한 시점에 수동 호출)
+  const handleTimeInputSync = () => {
+    const h = parseInt(inputHour || '0', 10);
+    const m = parseInt(inputMin || '0', 10);
+    const s = parseInt(inputSec || '0', 10);
+    const splitMs = (h * 3600 + m * 60 + s) * 1000;
+
+    if (splitMs >= 0 && splitMs <= duration) {
+      setSplitPosition(splitMs);
+    } else {
+      Alert.alert("알림", "파일 길이를 초과하는 시간입니다. 🌸");
+    }
+  };
+
+  // 수평 재생바 드래그
+  const handleProgressChange = (value: number) => {
+    setCurrentPosition(value);
+  };
+
+  const handleProgressComplete = async (value: number) => {
+    try {
+      await AudioEditor.seekTo(Math.floor(value));
+    } catch (e) { console.error(e); }
   };
 
   const pickFile = async () => {
@@ -101,11 +139,12 @@ const App = () => {
       const res = await DocumentPicker.pick({ type: [DocumentPicker.types.audio] });
       const file = res[0];
       setIsAnalyzing(true);
-      setSplitPosition(null);
+      isInitialSet.current = false; // 새 파일이므로 초기화 플래그 리셋 🌸
 
       const realPath = await AudioEditor.getRealPath(file.uri);
       const d = await AudioEditor.getAudioDuration(realPath);
       
+      setFileTimestamp(Date.now());
       setFileUri(realPath);
       setDuration(d);
       setSelectedFile(file);
@@ -129,9 +168,7 @@ const App = () => {
         stopProgressTimer();
       } else {
         await AudioEditor.startPlay(fileUri);
-        if (currentPosition > 0) {
-          await AudioEditor.seekTo(Math.floor(currentPosition));
-        }
+        await AudioEditor.seekTo(Math.floor(currentPosition));
         setIsPlaying(true);
         startProgressTimer();
       }
@@ -147,19 +184,9 @@ const App = () => {
     setCurrentPosition(0);
   };
 
-  // 💡 입력창 수치에 따른 분할선 위치 동기화
-  useEffect(() => {
-    const h = parseInt(inputHour || '0', 10);
-    const m = parseInt(inputMin || '0', 10);
-    const s = parseInt(inputSec || '0', 10);
-    const splitMs = (h * 3600 + m * 60 + s) * 1000;
-
-    if (splitMs >= 0 && splitMs <= duration) {
-      setSplitPosition(splitMs);
-    }
-  }, [inputHour, inputMin, inputSec, duration]);
-
   const handleSplit = async () => {
+    // 💡 실행 전 입력창 숫자를 최종적으로 선 위치에 동기화
+    handleTimeInputSync();
     if (!fileUri || splitPosition === null) return;
 
     setIsProcessing(true);
@@ -171,7 +198,6 @@ const App = () => {
     try {
       await AudioEditor.trimAudio(fileUri, path1, 0, splitPosition);
       await AudioEditor.trimAudio(fileUri, path2, splitPosition, duration);
-
       setIsProcessing(false);
       Alert.alert("완료", "분할된 파일을 저장하시겠습니까?", [
         { text: "취소" },
@@ -187,18 +213,13 @@ const App = () => {
     try {
       const directory = await DocumentPicker.pickDirectory();
       if (!directory || !directory.uri) return;
-
       for (let i = 0; i < paths.length; i++) {
         const fileName = `split_${Date.now()}_${i === 0 ? 'front' : 'back'}.m4a`;
         await AudioEditor.saveToTreeUri(directory.uri, paths[i], fileName);
       }
       Alert.alert("성공", "파일 저장이 완료되었습니다! 🌸");
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
-
-  const splitX = (splitPosition !== null && duration > 0) ? (splitPosition / duration) * WAVEFORM_WIDTH : 0;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -217,7 +238,6 @@ const App = () => {
               {formatTime(currentPosition)} / {formatTime(duration)}
             </Text>
 
-            {/* 비주얼라이저 영역 */}
             <View style={styles.visualizerContainer}>
               <View style={styles.waveformWrapper}>
                 {isAnalyzing ? (
@@ -241,26 +261,41 @@ const App = () => {
                 )}
               </View>
 
-              {/* 💡 분할선 (노란색 점선) */}
-              {splitPosition !== null && splitPosition > 0 && (
-                <View style={[styles.splitLine, { left: splitX }]} />
-              )}
+              {/* 📍 1. 시각적인 노란색 분할선 */}
+              <View style={[styles.splitLine, { left: (splitPosition / duration) * WAVEFORM_WIDTH }]} />
+              
+              {/* 📍 2. 수직 분할선 조작용 투명 슬라이더 */}
+              <Slider
+                style={styles.splitSliderOverlay}
+                minimumValue={0}
+                maximumValue={duration}
+                value={splitPosition}
+                onValueChange={handleSplitChange}
+                onSlidingComplete={handleSplitComplete}
+                thumbTintColor="transparent"
+                minimumTrackTintColor="transparent"
+                maximumTrackTintColor="transparent"
+              />
+            </View>
 
-              {/* 💡 투명 슬라이더 (조작 레이어) */}
-              {!isAnalyzing && waveform.length > 0 && (
-                <Slider
-                  style={styles.overlaidSlider}
-                  minimumValue={0}
-                  maximumValue={duration}
-                  value={currentPosition}
-                  onValueChange={handleSliderChange}
-                  onSlidingComplete={handleSliderComplete}
-                  thumbTintColor="transparent"
-                  minimumTrackTintColor="transparent"
-                  maximumTrackTintColor="transparent"
-                  tapToSeek={true}
-                />
-              )}
+            {/* 📍 3. 하단 분홍색 수평 재생바 */}
+            <View style={styles.progressContainer}>
+              <View style={styles.progressBarWrapper}>
+                <View style={styles.progressBackground}>
+                  <View style={[styles.progressFill, { width: `${(currentPosition / duration) * 100}%` }]} />
+                </View>
+              </View>
+              <Slider
+                style={styles.horizontalSlider}
+                minimumValue={0}
+                maximumValue={duration}
+                value={currentPosition}
+                onValueChange={handleProgressChange}
+                onSlidingComplete={handleProgressComplete}
+                thumbTintColor="#FF4081"
+                minimumTrackTintColor="transparent"
+                maximumTrackTintColor="transparent"
+              />
             </View>
 
             <View style={styles.playerControls}>
@@ -275,13 +310,13 @@ const App = () => {
         )}
 
         <View style={styles.inputArea}>
-          <Text style={styles.label}>정밀 분할 지점 설정</Text>
+          <Text style={styles.label}>정밀 분할 지점 설정 (직접 입력 후 선 이동)</Text>
           <View style={styles.row}>
-            <TextInput style={styles.input} value={inputHour} onChangeText={setInputHour} keyboardType="numeric" />
+            <TextInput style={styles.input} value={inputHour} onChangeText={setInputHour} onBlur={handleTimeInputSync} keyboardType="numeric" />
             <Text style={styles.unit}>시</Text>
-            <TextInput style={styles.input} value={inputMin} onChangeText={setInputMin} keyboardType="numeric" />
+            <TextInput style={styles.input} value={inputMin} onChangeText={setInputMin} onBlur={handleTimeInputSync} keyboardType="numeric" />
             <Text style={styles.unit}>분</Text>
-            <TextInput style={styles.input} value={inputSec} onChangeText={setInputSec} keyboardType="numeric" />
+            <TextInput style={styles.input} value={inputSec} onChangeText={setInputSec} onBlur={handleTimeInputSync} keyboardType="numeric" />
             <Text style={styles.unit}>초</Text>
           </View>
         </View>
@@ -303,34 +338,230 @@ const App = () => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F5F7FA' },
-  scrollContent: { padding: 20, alignItems: 'center' },
-  title: { fontSize: 22, fontWeight: 'bold', marginVertical: 20, color: '#333' },
-  pickButton: { backgroundColor: '#6200EE', padding: 15, borderRadius: 10, width: '100%', marginBottom: 20 },
-  buttonText: { color: '#FFF', textAlign: 'center', fontWeight: 'bold' },
-  playerCard: { backgroundColor: '#FFF', padding: 20, borderRadius: 20, width: '100%', elevation: 8, alignItems: 'center' },
-  fileName: { fontSize: 14, color: '#636e72', marginBottom: 10 },
-  timer: { fontSize: 26, fontWeight: 'bold', color: '#2d3436', marginBottom: 20 },
-  visualizerContainer: { width: WAVEFORM_WIDTH, height: 120, position: 'relative', justifyContent: 'center', backgroundColor: '#F9F9F9', borderRadius: 15, overflow: 'hidden' },
-  waveformWrapper: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%' },
-  waveBar: { width: WAVEFORM_WIDTH / 80 - 1, marginHorizontal: 0.5, borderRadius: 2 },
-  statusText: { color: '#999', fontSize: 12 },
-  customPlayhead: { position: 'absolute', width: 2, height: '100%', backgroundColor: '#FF4081', zIndex: 20 },
-  splitLine: { position: 'absolute', width: 2, height: '100%', backgroundColor: '#FFD700', zIndex: 15, borderStyle: 'dashed', borderWidth: 1, borderColor: '#FFD700' },
-  overlaidSlider: { position: 'absolute', width: WAVEFORM_WIDTH, height: 120, zIndex: 30 },
-  playerControls: { flexDirection: 'row', marginTop: 20, width: '100%', justifyContent: 'center' },
-  iconBtn: { padding: 15, backgroundColor: '#E1E2FF', borderRadius: 10, marginHorizontal: 10 },
-  iconText: { color: '#6200EE', fontWeight: 'bold' },
-  stopBtn: { padding: 15, backgroundColor: '#FFE1E1', borderRadius: 10, marginHorizontal: 10 },
-  stopText: { color: '#FF4081', fontWeight: 'bold' },
-  inputArea: { marginVertical: 30, width: '100%', alignItems: 'center' },
-  label: { fontWeight: 'bold', marginBottom: 15, color: '#2d3436' },
-  row: { flexDirection: 'row', alignItems: 'center' },
-  input: { backgroundColor: '#FFF', borderBottomWidth: 2, borderBottomColor: '#6200EE', width: 50, textAlign: 'center', fontSize: 20, marginHorizontal: 5, color: '#333' },
-  unit: { fontSize: 16, color: '#636e72', marginRight: 10 },
-  splitButton: { backgroundColor: '#00B894', padding: 18, borderRadius: 12, width: '100%', marginTop: 10 },
-  splitButtonText: { color: '#FFF', textAlign: 'center', fontSize: 18, fontWeight: 'bold' },
-  disabledBtn: { backgroundColor: '#B2BEC3' }
+  // --- 1. 전체 레이아웃 (Layout) ---
+  container: { 
+    flex: 1, 
+    backgroundColor: '#F5F7FA' 
+  },
+  scrollContent: { 
+    padding: 20, 
+    alignItems: 'center' 
+  },
+  title: { 
+    fontSize: 22, 
+    fontWeight: 'bold', 
+    marginVertical: 20, 
+    color: '#333' 
+  },
+
+  // --- 2. 파일 선택 버튼 (File Picker) ---
+  pickButton: { 
+    backgroundColor: '#6200EE', 
+    padding: 15, 
+    borderRadius: 12, 
+    width: '100%', 
+    marginBottom: 20,
+    elevation: 3, // 안드로이드 그림자
+  },
+  buttonText: { 
+    color: '#FFF', 
+    textAlign: 'center', 
+    fontWeight: 'bold' 
+  },
+
+  // --- 3. 메인 플레이어 카드 (Player Card) ---
+  playerCard: { 
+    backgroundColor: '#FFF', 
+    padding: 20, 
+    borderRadius: 24, 
+    width: '100%', 
+    elevation: 8, 
+    alignItems: 'center',
+    shadowColor: '#000', // iOS 그림자
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 10,
+  },
+  fileName: { 
+    fontSize: 14, 
+    color: '#636e72', 
+    marginBottom: 8 
+  },
+  timer: { 
+    fontSize: 28, 
+    fontWeight: 'bold', 
+    color: '#2d3436', 
+    marginBottom: 20 
+  },
+
+  // --- 4. 파형 및 수직 분할선 영역 (Waveform & Split Line) ---
+  visualizerContainer: { 
+    width: WAVEFORM_WIDTH, 
+    height: 120, 
+    position: 'relative', 
+    justifyContent: 'center', 
+    backgroundColor: '#F9F9F9', 
+    borderRadius: 16,
+    overflow: 'hidden' // 선이 튀어나가지 않게 상냥하게 잡아줍니다.
+  },
+  waveformWrapper: { 
+    flexDirection: 'row', 
+    alignItems: 'center', 
+    justifyContent: 'center', 
+    width: '100%', 
+    height: '100%' 
+  },
+  waveBar: { 
+    width: WAVEFORM_WIDTH / 80 - 1, 
+    marginHorizontal: 0.5, 
+    borderRadius: 2 
+  },
+  statusText: { 
+    color: '#999', 
+    fontSize: 12 
+  },
+  
+  // 📍 수직 분할선 (실제로 보이는 노란 선)
+  splitLine: { 
+    position: 'absolute', 
+    width: 3, 
+    height: '100%', 
+    backgroundColor: '#FFEB3B', 
+    zIndex: 50 
+  },
+  // 📍 수직 분할선 조작 레이어 (투명 슬라이더)
+  splitSliderOverlay: { 
+    position: 'absolute', 
+    width: WAVEFORM_WIDTH, 
+    height: 120, 
+    top: 0, 
+    zIndex: 100 
+  },
+
+  // --- 5. 하단 수평 재생바 (Horizontal Progress Bar) ---
+  progressContainer: { 
+    width: WAVEFORM_WIDTH, 
+    height: 40, 
+    justifyContent: 'center', 
+    alignItems: 'center', 
+    marginTop: 24, 
+    position: 'relative' 
+  },
+  progressBarWrapper: { 
+    position: 'absolute', 
+    width: '100%', 
+    height: 8, 
+    justifyContent: 'center' 
+  },
+  progressBackground: { 
+    width: '100%', 
+    height: 8, 
+    backgroundColor: '#E0E0E0', 
+    borderRadius: 4, 
+    overflow: 'hidden' 
+  },
+  progressFill: { 
+    height: '100%', 
+    backgroundColor: '#FF4081' 
+  },
+  horizontalSlider: { 
+    width: WAVEFORM_WIDTH + 16, 
+    height: 40, 
+    zIndex: 10 
+  },
+
+  // --- 6. 재생 컨트롤 버튼 (Controls) ---
+  playerControls: { 
+    flexDirection: 'row', 
+    marginTop: 20, 
+    width: '100%', 
+    justifyContent: 'center' 
+  },
+  iconBtn: { 
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    backgroundColor: '#E1E2FF', 
+    borderRadius: 12, 
+    marginHorizontal: 8 
+  },
+  iconText: { 
+    color: '#6200EE', 
+    fontWeight: 'bold' 
+  },
+  stopBtn: { 
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    backgroundColor: '#FFE1E1', 
+    borderRadius: 12, 
+    marginHorizontal: 8 
+  },
+  stopText: { 
+    color: '#FF4081', 
+    fontWeight: 'bold' 
+  },
+
+  // --- 7. 정밀 입력 영역 (Time Input) ---
+  inputArea: { 
+    marginVertical: 32, 
+    width: '100%', 
+    alignItems: 'center',
+    backgroundColor: '#FFF',
+    padding: 20,
+    borderRadius: 20,
+  },
+  label: { 
+    fontWeight: 'bold', 
+    marginBottom: 16, 
+    color: '#2d3436',
+    fontSize: 15,
+  },
+  row: { 
+    flexDirection: 'row', 
+    alignItems: 'center' 
+  },
+  input: { 
+    backgroundColor: '#F1F3F5', 
+    borderRadius: 8,
+    width: 55, 
+    height: 45,
+    textAlign: 'center', 
+    fontSize: 20, 
+    marginHorizontal: 4, 
+    color: '#333',
+    fontWeight: '600',
+  },
+  unit: { 
+    fontSize: 14, 
+    color: '#636e72', 
+    marginRight: 8 
+  },
+
+  // --- 8. 최종 실행 버튼 (Action Button) ---
+  splitButton: { 
+    backgroundColor: '#00C853', 
+    padding: 18, 
+    borderRadius: 14, 
+    width: '100%', 
+    marginTop: 10,
+    elevation: 4,
+  },
+  splitButtonText: { 
+    color: '#FFF', 
+    textAlign: 'center', 
+    fontWeight: 'bold', 
+    fontSize: 18 
+  },
+  disabledBtn: { 
+    backgroundColor: '#B2BEC3' 
+  },
+  // --- Styles 추가 ---
+errorTestButton: {
+  backgroundColor: '#FF7675', // 부드러운 빨간색
+  padding: 15,
+  borderRadius: 12,
+  width: '100%',
+  marginBottom: 20,
+},
 });
 
 export default App;

@@ -19,14 +19,14 @@ class AudioEditorModule(reactContext: ReactApplicationContext) : ReactContextBas
 
     @ReactMethod
     fun getWaveformData(path: String, points: Int, promise: Promise) {
-        // 💡 무거운 디코딩 작업은 반드시 별도 스레드에서 수행해야 합니다.
         Thread {
             val extractor = MediaExtractor()
             try {
                 extractor.setDataSource(path)
                 val trackIndex = 0
                 val format = extractor.getTrackFormat(trackIndex)
-                val codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                val codec = MediaCodec.createDecoderByType(mime)
                 codec.configure(format, null, null, 0)
                 codec.start()
 
@@ -35,9 +35,12 @@ class AudioEditorModule(reactContext: ReactApplicationContext) : ReactContextBas
                 var isEOS = false
                 extractor.selectTrack(trackIndex)
 
-                // 디코딩 루프
+                // 💡 [최적화 1] 샘플 건너뛰기 변수
+                var sampleCount = 0
+                val skipInterval = 5 // 5번 중 1번만 진폭 계산 (숫자가 클수록 빠르지만 정밀도 하락)
+
                 while (!isEOS) {
-                    val inIndex = codec.dequeueInputBuffer(10000)
+                    val inIndex = codec.dequeueInputBuffer(5000) // 타임아웃 단축
                     if (inIndex >= 0) {
                         val buffer = codec.getInputBuffer(inIndex)
                         val sampleSize = extractor.readSampleData(buffer!!, 0)
@@ -46,26 +49,33 @@ class AudioEditorModule(reactContext: ReactApplicationContext) : ReactContextBas
                             isEOS = true
                         } else {
                             codec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
-                            extractor.advance()
+                            
+                            // 💡 [최적화 2] 물리적으로 샘플을 건너뛰어 읽기 속도 향상
+                            // 매번 advance() 하지 않고 일정 구간을 점프합니다.
+                            repeat(skipInterval) { extractor.advance() }
                         }
                     }
 
-                    var outIndex = codec.dequeueOutputBuffer(info, 10000)
-                    // 💡 여러 개의 출력 버퍼가 쌓여있을 수 있으므로 루프로 처리하는 것이 안전합니다.
+                    var outIndex = codec.dequeueOutputBuffer(info, 5000)
                     while (outIndex >= 0) {
-                        val outBuffer = codec.getOutputBuffer(outIndex)
-                        val pcmData = ShortArray(info.size / 2)
-                        outBuffer?.asShortBuffer()?.get(pcmData)
-                        
-                        var sum = 0L
-                        for (sample in pcmData) {
-                            sum += abs(sample.toInt())
+                        // 💡 [최적화 3] 모든 출력 버퍼를 계산하지 않고 건너뜁니다.
+                        if (sampleCount % skipInterval == 0) {
+                            val outBuffer = codec.getOutputBuffer(outIndex)
+                            val pcmData = ShortArray(info.size / 2)
+                            outBuffer?.asShortBuffer()?.get(pcmData)
+                            
+                            if (pcmData.isNotEmpty()) {
+                                var sum = 0L
+                                // 연산량을 줄이기 위해 내부 루프에서도 샘플링 가능
+                                for (i in pcmData.indices step 2) { 
+                                    sum += abs(pcmData[i].toInt())
+                                }
+                                amplitudes.add(sum.toFloat() / (pcmData.size / 2))
+                            }
                         }
-                        if (pcmData.isNotEmpty()) {
-                            amplitudes.add(sum.toFloat() / pcmData.size)
-                        }
+                        sampleCount++
                         codec.releaseOutputBuffer(outIndex, false)
-                        outIndex = codec.dequeueOutputBuffer(info, 0) // 다음 버퍼 확인
+                        outIndex = codec.dequeueOutputBuffer(info, 0)
                     }
                 }
 
@@ -73,27 +83,24 @@ class AudioEditorModule(reactContext: ReactApplicationContext) : ReactContextBas
                 codec.release()
                 extractor.release()
 
-                // 리샘플링 및 React Native로 결과 전달
+                // 결과 리샘플링 (기존 로직 유지)
                 val sampledWaveform = WritableNativeArray()
                 if (amplitudes.isNotEmpty()) {
-                    val step = amplitudes.size / points
+                    val step = amplitudes.size.toFloat() / points
                     val maxAmplitude = amplitudes.maxOrNull() ?: 1.0f
-                    
                     for (i in 0 until points) {
-                        val index = (i * step).coerceAtMost(amplitudes.size - 1)
+                        val index = (i * step).toInt().coerceAtMost(amplitudes.size - 1)
                         val normalized = (amplitudes[index] / maxAmplitude) * 1.5
-                        sampledWaveform.pushDouble(normalized.toDouble().coerceAtMost(1.0))
+                        sampledWaveform.pushDouble(normalized.coerceAtMost(1.0))
                     }
                 }
-                
-                // 성공 결과 반환
                 promise.resolve(sampledWaveform)
 
             } catch (e: Exception) {
                 try { extractor.release() } catch (ex: Exception) {}
                 promise.reject("ERR_WAVEFORM", e.message)
             }
-        }.start() // 💡 스레드 시작
+        }.start()
     }
 
     @ReactMethod
